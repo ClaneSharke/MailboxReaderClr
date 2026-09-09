@@ -35,11 +35,16 @@ WITH PERMISSION_SET = EXTERNAL_ACCESS;
 GO
 
 -- 4) Create the stored procedure wrapper
+--    @Password is optional. Leave it NULL (default) for app-only auth using
+--    @ClientSecret. Supply it to use delegated username/password (ROPC) auth
+--    against the mailbox itself instead -- see README.md for when that's
+--    appropriate and what it requires (public client flow / consent / no MFA).
 CREATE PROCEDURE dbo.usp_ReadMailbox
     @TenantId      NVARCHAR(100),
     @ClientId      NVARCHAR(100),
-    @ClientSecret  NVARCHAR(200),
+    @ClientSecret  NVARCHAR(200) = NULL,
     @MailboxUpn    NVARCHAR(320),
+    @Password      NVARCHAR(200) = NULL,
     @FolderName    NVARCHAR(100) = 'inbox',
     @Top           INT = 25,
     @UnreadOnly    BIT = 0
@@ -50,7 +55,7 @@ GO
    Example usage
    ============================================================================ */
 
--- Just view results:
+-- App-only mode (default -- recommended): no password, uses ClientSecret
 EXEC dbo.usp_ReadMailbox
     @TenantId     = 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx',
     @ClientId     = 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx',
@@ -59,6 +64,15 @@ EXEC dbo.usp_ReadMailbox
     @FolderName   = 'inbox',
     @Top          = 25,
     @UnreadOnly   = 1;
+
+-- Delegated password (ROPC) mode: supply @Password, ClientSecret becomes optional
+-- (include it only if the app registration is a confidential client)
+EXEC dbo.usp_ReadMailbox
+    @TenantId   = 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx',
+    @ClientId   = 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx',
+    @MailboxUpn = 'serviceaccount@yourdomain.com',
+    @Password   = 'the-mailbox-password',
+    @Top        = 25;
 
 -- Land results in a staging table:
 /*

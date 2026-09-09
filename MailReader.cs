@@ -12,11 +12,21 @@ namespace MailboxReaderClr
 {
     /// <summary>
     /// SQLCLR stored procedure that reads messages from an Exchange Online / Office 365
-    /// mailbox via the Microsoft Graph API, using app-only (client credentials) OAuth2.
+    /// mailbox via the Microsoft Graph API.
     ///
-    /// Requires an Azure AD app registration with the Mail.Read (or Mail.ReadBasic.All)
-    /// Application permission, ideally restricted to the target mailbox via an
-    /// Exchange Online Application Access Policy. See README.md for setup steps.
+    /// Two auth modes, selected by whether @Password is supplied:
+    ///   - App-only (default, @Password NULL): client_credentials grant using
+    ///     TenantId/ClientId/ClientSecret. Requires the app registration to have the
+    ///     Mail.Read (or Mail.ReadBasic.All) Application permission, ideally restricted
+    ///     to the target mailbox via an Exchange Online Application Access Policy.
+    ///   - Delegated password (ROPC, @Password supplied): resource-owner password
+    ///     credentials grant using the mailbox's own username/password. Requires the
+    ///     app registration to have the Mail.Read Delegated permission (admin consent),
+    ///     "Allow public client flows" enabled (unless also passing ClientSecret for a
+    ///     confidential client), and the mailbox account to be excluded from MFA/
+    ///     Conditional Access -- ROPC cannot satisfy an MFA challenge. Microsoft
+    ///     discourages ROPC for new integrations; prefer app-only where possible.
+    ///     See README.md for setup steps and caveats for both modes.
     /// </summary>
     public class MailReader
     {
@@ -26,15 +36,23 @@ namespace MailboxReaderClr
             SqlString clientId,
             SqlString clientSecret,
             SqlString mailboxUpn,
+            SqlString password,
             SqlString folderName,
             SqlInt32 top,
             SqlBoolean unreadOnly)
         {
             ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
 
-            if (tenantId.IsNull || clientId.IsNull || clientSecret.IsNull || mailboxUpn.IsNull)
+            if (tenantId.IsNull || clientId.IsNull || mailboxUpn.IsNull)
             {
-                throw new ArgumentException("TenantId, ClientId, ClientSecret and MailboxUpn are all required.");
+                throw new ArgumentException("TenantId, ClientId and MailboxUpn are all required.");
+            }
+
+            bool useDelegatedPassword = !password.IsNull && password.Value.Length > 0;
+
+            if (!useDelegatedPassword && clientSecret.IsNull)
+            {
+                throw new ArgumentException("ClientSecret is required when Password is not supplied (app-only mode). Pass Password to use delegated username/password auth instead.");
             }
 
             string folder = (folderName.IsNull || folderName.Value.Length == 0) ? "inbox" : folderName.Value;
@@ -45,13 +63,27 @@ namespace MailboxReaderClr
             }
             bool onlyUnread = !unreadOnly.IsNull && unreadOnly.Value;
 
-            string accessToken = GetAppOnlyToken(tenantId.Value, clientId.Value, clientSecret.Value);
+            string accessToken;
+            string mailboxSegment;
+
+            if (useDelegatedPassword)
+            {
+                string clientSecretOrNull = clientSecret.IsNull ? null : clientSecret.Value;
+                accessToken = GetDelegatedTokenViaPassword(tenantId.Value, clientId.Value, clientSecretOrNull, mailboxUpn.Value, password.Value);
+                // A delegated (ROPC) token is bound to the signed-in mailbox itself, so use /me instead of /users/{upn}.
+                mailboxSegment = "me";
+            }
+            else
+            {
+                accessToken = GetAppOnlyToken(tenantId.Value, clientId.Value, clientSecret.Value);
+                mailboxSegment = "users/" + Uri.EscapeDataString(mailboxUpn.Value);
+            }
 
             string filterClause = onlyUnread ? "&$filter=isRead eq false" : string.Empty;
 
             string url = string.Format(
-                "https://graph.microsoft.com/v1.0/users/{0}/mailFolders/{1}/messages?$top={2}&$select=id,subject,from,receivedDateTime,isRead,hasAttachments,bodyPreview&$orderby=receivedDateTime desc{3}",
-                Uri.EscapeDataString(mailboxUpn.Value),
+                "https://graph.microsoft.com/v1.0/{0}/mailFolders/{1}/messages?$top={2}&$select=id,subject,from,receivedDateTime,isRead,hasAttachments,bodyPreview&$orderby=receivedDateTime desc{3}",
+                mailboxSegment,
                 Uri.EscapeDataString(folder),
                 topCount,
                 filterClause);
@@ -142,6 +174,46 @@ namespace MailboxReaderClr
             }
 
             string responseJson = ReadResponseOrThrow(request, "Token request");
+
+            var serializer = new JavaScriptSerializer();
+            var tokenResponse = (Dictionary<string, object>)serializer.DeserializeObject(responseJson);
+
+            if (!tokenResponse.ContainsKey("access_token"))
+            {
+                throw new Exception("Token response did not contain an access_token: " + responseJson);
+            }
+
+            return (string)tokenResponse["access_token"];
+        }
+
+        private static string GetDelegatedTokenViaPassword(string tenantId, string clientId, string clientSecretOrNull, string username, string password)
+        {
+            string tokenUrl = string.Format("https://login.microsoftonline.com/{0}/oauth2/v2.0/token", tenantId);
+
+            var bodyBuilder = new StringBuilder();
+            bodyBuilder.Append("client_id=").Append(Uri.EscapeDataString(clientId));
+            bodyBuilder.Append("&scope=").Append(Uri.EscapeDataString("https://graph.microsoft.com/Mail.Read offline_access"));
+            bodyBuilder.Append("&username=").Append(Uri.EscapeDataString(username));
+            bodyBuilder.Append("&password=").Append(Uri.EscapeDataString(password));
+            bodyBuilder.Append("&grant_type=password");
+            if (!string.IsNullOrEmpty(clientSecretOrNull))
+            {
+                bodyBuilder.Append("&client_secret=").Append(Uri.EscapeDataString(clientSecretOrNull));
+            }
+
+            byte[] bodyBytes = Encoding.UTF8.GetBytes(bodyBuilder.ToString());
+
+            HttpWebRequest request = (HttpWebRequest)WebRequest.Create(tokenUrl);
+            request.Method = "POST";
+            request.ContentType = "application/x-www-form-urlencoded";
+            request.ContentLength = bodyBytes.Length;
+
+            using (Stream requestStream = request.GetRequestStream())
+            {
+                requestStream.Write(bodyBytes, 0, bodyBytes.Length);
+            }
+
+            string responseJson = ReadResponseOrThrow(request, "Delegated (ROPC) token request");
 
             var serializer = new JavaScriptSerializer();
             var tokenResponse = (Dictionary<string, object>)serializer.DeserializeObject(responseJson);
