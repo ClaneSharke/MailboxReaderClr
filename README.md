@@ -165,6 +165,19 @@ an example of inserting the result set straight into a staging table.
   under version control and reviewed like any other code with network
   access from inside SQL Server.
 
+## Troubleshooting
+
+**`Msg 10301 ... references assembly 'system.web.extensions' ... which is not
+present in the current database`** -- this was a bug in v1.0.0: it used
+`JavaScriptSerializer` (from `System.Web.Extensions`), which SQL Server does
+*not* auto-trust the way it does `mscorlib`/`System`/`System.Data`, so it
+needed its own separate `CREATE ASSEMBLY` registration. Fixed in v1.0.1 by
+replacing it with a small dependency-free JSON parser (`JsonMini.cs`) --
+`MailboxReaderClr.dll` now references only `mscorlib`, `System`, and
+`System.Data`, all of which SQL Server trusts by default. If you hit this
+error, drop the old assembly/trusted-assembly entry and redeploy with the
+current release.
+
 ## Uninstall
 
 ```sql

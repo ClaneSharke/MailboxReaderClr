@@ -5,7 +5,6 @@ using System.Data.SqlTypes;
 using System.IO;
 using System.Net;
 using System.Text;
-using System.Web.Script.Serialization;
 using Microsoft.SqlServer.Server;
 
 namespace MailboxReaderClr
@@ -90,13 +89,11 @@ namespace MailboxReaderClr
 
             string json = GraphGet(url, accessToken);
 
-            var serializer = new JavaScriptSerializer();
-            serializer.MaxJsonLength = int.MaxValue;
-            var root = (Dictionary<string, object>)serializer.DeserializeObject(json);
+            var root = (Dictionary<string, object>)JsonMini.Parse(json);
 
-            object[] items = (root.ContainsKey("value") && root["value"] != null)
-                ? (object[])root["value"]
-                : new object[0];
+            List<object> items = (root.ContainsKey("value") && root["value"] != null)
+                ? (List<object>)root["value"]
+                : new List<object>();
 
             SqlDataRecord record = new SqlDataRecord(
                 new SqlMetaData("MessageId", SqlDbType.NVarChar, 200),
@@ -175,8 +172,7 @@ namespace MailboxReaderClr
 
             string responseJson = ReadResponseOrThrow(request, "Token request");
 
-            var serializer = new JavaScriptSerializer();
-            var tokenResponse = (Dictionary<string, object>)serializer.DeserializeObject(responseJson);
+            var tokenResponse = (Dictionary<string, object>)JsonMini.Parse(responseJson);
 
             if (!tokenResponse.ContainsKey("access_token"))
             {
@@ -215,8 +211,7 @@ namespace MailboxReaderClr
 
             string responseJson = ReadResponseOrThrow(request, "Delegated (ROPC) token request");
 
-            var serializer = new JavaScriptSerializer();
-            var tokenResponse = (Dictionary<string, object>)serializer.DeserializeObject(responseJson);
+            var tokenResponse = (Dictionary<string, object>)JsonMini.Parse(responseJson);
 
             if (!tokenResponse.ContainsKey("access_token"))
             {
