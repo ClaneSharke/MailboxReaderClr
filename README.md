@@ -1,10 +1,21 @@
 # MailboxReaderClr
 
-A SQLCLR stored procedure (`dbo.usp_ReadMailbox`) that reads messages from an
-Exchange Online / Office 365 mailbox directly from T-SQL, using the Microsoft
-Graph API. Built for a dedicated service-account mailbox, not a full mail
-client -- it returns a result set of message metadata + body preview per
-call.
+SQLCLR stored procedures that read messages from a mailbox directly from
+T-SQL, for a dedicated service-account mailbox rather than as a full mail
+client. Two separate procs, because the protocol and auth model genuinely
+differ by mailbox location:
+
+| Proc | Mailbox is on | Protocol | Auth |
+|---|---|---|---|
+| `dbo.usp_ReadMailbox` | Exchange Online / Microsoft 365 | Microsoft Graph (REST/JSON) | Azure AD OAuth2 (app-only or ROPC) |
+| `dbo.usp_ReadMailbox_EWS` | On-premises Exchange Server | EWS (SOAP/XML) | Windows (NTLM/Kerberos) + Exchange Impersonation |
+
+Both live in the same `MailboxReaderClr.dll` -- `MailReader.cs` for Graph,
+`EwsMailReader.cs` for EWS -- so you only register one assembly in SQL
+Server either way and just create whichever proc(s) you need. The rest of
+this section covers the Graph/Exchange Online proc; jump to
+[**On-premises Exchange (EWS)**](#on-premises-exchange-ews) for the on-prem
+one.
 
 Two auth modes, chosen by whether you pass `@Password`:
 
@@ -139,6 +150,138 @@ EXEC dbo.usp_ReadMailbox
 Returns one row per message: `MessageId, Subject, FromAddress, FromName,
 ReceivedDateTime, IsRead, HasAttachments, BodyPreview`. See `Deploy.sql` for
 an example of inserting the result set straight into a staging table.
+
+## On-premises Exchange (EWS)
+
+`dbo.usp_ReadMailbox_EWS` reads a mailbox on your own on-premises Exchange
+Server (2013+) via EWS -- no internet access, no Azure AD, no Graph. It
+POSTs a SOAP `FindItem` request to your Exchange server's own EWS endpoint
+and authenticates with Windows credentials instead of an OAuth2 token.
+
+> **Built but not field-verified.** This was written from EWS's documented
+> `FindItem` schema, but I don't have a live on-premises Exchange server to
+> test it against in the environment that built this. Treat the SOAP
+> request shape, field names, and `RequestServerVersion` as a strong first
+> draft -- validate against your actual server (see Troubleshooting below)
+> rather than assuming it's correct out of the box, the way the Graph proc
+> has been. It does compile cleanly (`dotnet build -c Release`, 0 warnings /
+> 0 errors) and its only assembly references are `mscorlib`, `System`,
+> `System.Data`, and `System.Xml` -- see the `System.Xml` trust note in
+> step 4 below.
+
+### 1. Grant impersonation rights (Exchange Management Shell, on your Exchange server)
+
+Whichever Windows account calls this proc -- the SQL Server service
+account's own identity, or an explicit account you pass via
+`@Domain`/`@Username`/`@Password` -- needs the **ApplicationImpersonation**
+management role, scoped to just the target mailbox (the on-prem equivalent
+of the Application Access Policy used for the Graph proc):
+
+```powershell
+New-ManagementScope -Name "MailboxReaderScope" `
+  -RecipientRestrictionFilter "PrimarySmtpAddress -eq 'serviceaccount@yourdomain.local'"
+
+New-ManagementRoleAssignment -Name "MailboxReaderImpersonation" `
+  -Role "ApplicationImpersonation" `
+  -User "YOURDOMAIN\svc-mailreader" `
+  -CustomRecipientWriteScope "MailboxReaderScope"
+```
+
+Replace `YOURDOMAIN\svc-mailreader` with whichever account is actually
+making the call -- the SQL Server service account if you're using
+`UseDefaultCredentials`, or the account named in `@Username` otherwise.
+
+### 2. Find your EWS URL
+
+Usually `https://<your-exchange-server>/EWS/Exchange.asmx`. If you're not
+sure, Exchange Management Shell can confirm it: `Get-WebServicesVirtualDirectory | fl Name,*Url*`.
+
+### 3. TLS certificate
+
+If your Exchange server uses an internal-CA or self-signed certificate,
+`HttpWebRequest` will refuse it by default. Install your internal CA's root
+certificate into the SQL Server machine's trusted root store -- don't
+disable certificate validation in code to work around it.
+
+### 4. Build and deploy
+
+Same DLL, same build step as above (`dotnet build -c Release`). Run
+`Deploy-EWS.sql` -- if you've already run `Deploy.sql` for the Graph proc,
+the assembly is already registered and `Deploy-EWS.sql` just adds the new
+`dbo.usp_ReadMailbox_EWS` proc; otherwise it registers the assembly too.
+
+**A note on `System.Xml`.** The EWS code uses `System.Xml.XmlDocument` to
+build and parse the SOAP request/response, so the built DLL now references
+`System.Xml` in addition to `mscorlib`/`System`/`System.Data`.
+`System.Xml` is on Microsoft's own documented list of assemblies SQL
+Server's CLR host supports (the same list `System.Data` is on) -- unlike
+`System.Web.Extensions`, which caused the v1.0.0 bug described in
+Troubleshooting below and is *not* on that list. So `System.Xml` should
+already be trusted without any extra step, the same way `System.Data` is.
+That said, this hasn't been confirmed against a live SQL Server in this
+project the way the `System.Web.Extensions` failure was. If you deploy
+`Deploy-EWS.sql` and hit a **Msg 10301** error naming `system.xml`, it
+means your SQL Server instance doesn't auto-trust it either -- register it
+exactly like the DLL itself is registered, by trusting its hash:
+```sql
+DECLARE @Hash VARBINARY(64) = HASHBYTES('SHA2_512',
+    (SELECT content FROM sys.assembly_files WHERE assembly_id =
+        (SELECT assembly_id FROM sys.assemblies WHERE name = 'System.Xml')));
+-- or, simpler: locate System.Xml.dll under
+-- C:\Windows\Microsoft.NET\Framework64\v4.0.30319\ and trust that file's
+-- hash with sys.sp_add_trusted_assembly, the same way Deploy-EWS.sql
+-- trusts MailboxReaderClr.dll, then CREATE ASSEMBLY [System.Xml] FROM
+-- that path WITH PERMISSION_SET = SAFE.
+```
+Open an issue with the exact error text if this happens -- it'll confirm
+one way or the other and the README can drop the hedge.
+
+### 5. Call it
+
+Using the SQL Server service account's own Windows identity (omit
+`@Domain`/`@Username`/`@Password`):
+```sql
+EXEC dbo.usp_ReadMailbox_EWS
+    @EwsUrl     = 'https://mail.yourdomain.local/EWS/Exchange.asmx',
+    @MailboxUpn = 'serviceaccount@yourdomain.local',
+    @Top        = 25;
+```
+
+With explicit Windows credentials instead:
+```sql
+EXEC dbo.usp_ReadMailbox_EWS
+    @EwsUrl     = 'https://mail.yourdomain.local/EWS/Exchange.asmx',
+    @MailboxUpn = 'serviceaccount@yourdomain.local',
+    @Domain     = 'YOURDOMAIN',
+    @Username   = 'svc-mailreader',
+    @Password   = 'the-account-password',
+    @Top        = 25;
+```
+
+Returns the same shape as the Graph proc: `MessageId, Subject, FromAddress,
+FromName, ReceivedDateTime, IsRead, HasAttachments, BodyPreview`.
+
+### EWS troubleshooting
+
+- **401 Unauthorized** -- the connecting account either doesn't have
+  `ApplicationImpersonation` scoped to the target mailbox (step 1), or the
+  credentials themselves are wrong. Test the same credentials against EWS
+  outside of SQL Server first if possible (e.g. a small standalone .NET
+  console app) to isolate whether it's an auth problem or a SQL Server
+  problem.
+- **A SOAP fault, or an empty result set with no error** -- the proc
+  surfaces both SOAP-level faults and EWS-level `ResponseClass="Error"`
+  messages as thrown exceptions, so read the actual error text; it usually
+  names the problem directly (bad folder id, impersonation not permitted,
+  schema version too old for a requested field, etc.).
+- **Certificate errors** -- see the TLS note in step 3.
+- **Nothing matches your server's exact behavior** -- since this hasn't
+  been run against a live server, the most likely failure point is a
+  mismatch between the exact `FindItem` request shape here and what your
+  specific Exchange version/CU expects. Capture the raw SOAP response
+  (temporarily have the proc surface it, or capture the request with a tool
+  like Fiddler between a test client and the server) and we can adjust the
+  request in `EwsMailReader.cs` from there.
 
 ## Security notes worth acting on
 
