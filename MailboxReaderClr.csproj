@@ -9,6 +9,16 @@
     <Deterministic>true</Deterministic>
   </PropertyGroup>
 
+  <!-- EwsToSqlSync is a separate, standalone project living in a subfolder of this one.
+       Explicitly exclude it (and any obj/bin) from this project's default C# glob, so its
+       files, and its own generated AssemblyInfo, never get compiled twice, once for
+       each project. -->
+  <ItemGroup>
+    <Compile Remove="EwsToSqlSync\**\*.cs" />
+    <Compile Remove="obj\**\*.cs" />
+    <Compile Remove="bin\**\*.cs" />
+  </ItemGroup>
+
   <ItemGroup>
     <Reference Include="System.Data" />
   </ItemGroup>
