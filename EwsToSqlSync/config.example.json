@@ -1,0 +1,20 @@
+{
+  "EwsUrl": "https://webmail.yourdomain.co.za/EWS/Exchange.asmx",
+  "MailboxUpn": "serviceaccount@yourdomain.co.za",
+
+  "_comment_auth": "Domain/Username/Password are OPTIONAL. Omit all three (or leave them out entirely) to run as whatever Windows account this process/scheduled task runs as -- that account needs ApplicationImpersonation scoped to MailboxUpn, same as the SQLCLR EWS proc. Only set these if you need to run as a *different* account than the task's own identity.",
+  "Domain": null,
+  "Username": null,
+  "Password": null,
+
+  "FolderName": "inbox",
+  "Top": 50,
+  "UnreadOnly": false,
+
+  "_comment_sql": "Use a SQL login with INSERT + SELECT on TableName. Windows auth (Integrated Security=true) also works if this process runs as an account with DB access.",
+  "SqlConnectionString": "Server=YOUR_SQL_SERVER;Database=YourDatabase;User Id=svc_mailsync;Password=your-sql-password;Encrypt=True;TrustServerCertificate=True;",
+  "TableName": "dbo.MailboxMessages",
+
+  "_comment_log": "Optional. If set, each run's log lines are appended here as well as printed to stdout (stdout isn't visible when Task Scheduler runs this unattended, so a log file is how you'll see what happened).",
+  "LogFile": "C:\\Logs\\EwsToSqlSync.log"
+}

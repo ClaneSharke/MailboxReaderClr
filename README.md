@@ -17,6 +17,13 @@ this section covers the Graph/Exchange Online proc; jump to
 [**On-premises Exchange (EWS)**](#on-premises-exchange-ews) for the on-prem
 one.
 
+If you'd rather not deal with SQL Server CLR deployment at all (assembly
+trust hashes, `CREATE ASSEMBLY`, and the failure modes that come with
+them), there's also [**EwsToSqlSync**](#standalone-alternative-ewstosqlsync-no-sql-server-clr-at-all)
+-- a standalone scheduled-task alternative to the on-prem EWS proc that
+writes to SQL Server with a plain login instead of running inside SQL
+Server itself.
+
 Two auth modes, chosen by whether you pass `@Password`:
 
 | Mode | Trigger | Notes |
@@ -282,6 +289,121 @@ FromName, ReceivedDateTime, IsRead, HasAttachments, BodyPreview`.
   (temporarily have the proc surface it, or capture the request with a tool
   like Fiddler between a test client and the server) and we can adjust the
   request in `EwsMailReader.cs` from there.
+
+## Standalone alternative: EwsToSqlSync (no SQL Server CLR at all)
+
+`EwsToSqlSync/` is a second, independent way to get the same result --
+messages from an on-premises Exchange mailbox landing in a SQL Server table
+-- without touching SQL Server CLR at all. It's a plain `.exe` you run on a
+schedule via Windows Task Scheduler, using the exact same EWS `FindItem`
+logic as `usp_ReadMailbox_EWS` (same request shape, same caveats about
+validating against your Exchange version), but writing rows with an
+ordinary SQL login instead of running inside `sqlservr.exe`.
+
+**Why this exists:** SQL Server CLR's strict security model (assembly
+trust hashes, `CREATE ASSEMBLY`, stale-registration failures like "Could
+not find Type ... in assembly") adds a whole class of deployment problems
+that have nothing to do with reading a mailbox. If that's causing more
+friction than it's worth in your environment, or your DBAs have a blanket
+policy against CLR/`EXTERNAL_ACCESS` assemblies, this sidesteps all of it.
+
+| | `usp_ReadMailbox_EWS` (SQLCLR) | `EwsToSqlSync` (standalone) |
+|---|---|---|
+| Runs inside | SQL Server itself | Its own process, on a schedule |
+| Deploy mechanism | `CREATE ASSEMBLY` + trust hash | Copy an `.exe` + a Task Scheduler job |
+| Failure mode when something's wrong | SQL Server CLR error messages | A plain .NET exception + log file |
+| SQL access needed | `EXTERNAL_ACCESS` CLR assembly | An ordinary SQL login with `INSERT`/`SELECT` |
+| Duplicate-row protection | None built in (returns a result set each call; dedupe is the caller's job) | Built in -- checks `MessageId` before inserting |
+| Trigger | Whenever the proc is called (a job step, another proc, etc.) | Windows Task Scheduler, on whatever cadence you set |
+
+Both are equally valid; pick whichever fits how your environment already
+works. Nothing about choosing one commits you to it forever -- they write
+compatible-shaped data (same columns), so switching later is cheap.
+
+### 1. Grant impersonation rights
+
+Same requirement as the SQLCLR proc -- see [step 1 above](#1-grant-impersonation-rights-exchange-management-shell-on-your-exchange-server).
+The account that needs `ApplicationImpersonation` here is whichever account
+the scheduled task runs as (its "Run as" identity), unless you set
+`Domain`/`Username`/`Password` in `config.json` to run as someone else.
+
+### 2. Create the destination table
+
+```sql
+-- EwsToSqlSync/CreateTable.sql
+CREATE TABLE dbo.MailboxMessages (
+    MessageId         NVARCHAR(400)  NOT NULL PRIMARY KEY,
+    Subject           NVARCHAR(1000) NULL,
+    FromAddress       NVARCHAR(320)  NULL,
+    FromName          NVARCHAR(200)  NULL,
+    ReceivedDateTime  DATETIME2      NULL,
+    IsRead            BIT            NULL,
+    HasAttachments    BIT            NULL,
+    BodyPreview       NVARCHAR(4000) NULL,
+    LoadedAtUtc       DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME()
+);
+```
+
+### 3. Build it
+
+```
+dotnet build EwsToSqlSync/EwsToSqlSync.csproj -c Release
+```
+
+Produces `EwsToSqlSync/bin/Release/net472/EwsToSqlSync.exe`, alongside
+`config.example.json` (copied automatically). No SQL Server involvement at
+build time at all.
+
+### 4. Configure it
+
+Copy `config.example.json` to `config.json` next to the `.exe` and fill it
+in:
+
+```json
+{
+  "EwsUrl": "https://webmail.yourdomain.co.za/EWS/Exchange.asmx",
+  "MailboxUpn": "serviceaccount@yourdomain.co.za",
+  "FolderName": "inbox",
+  "Top": 50,
+  "UnreadOnly": false,
+  "SqlConnectionString": "Server=YOUR_SQL_SERVER;Database=YourDatabase;User Id=svc_mailsync;Password=your-sql-password;Encrypt=True;TrustServerCertificate=True;",
+  "TableName": "dbo.MailboxMessages",
+  "LogFile": "C:\\Logs\\EwsToSqlSync.log"
+}
+```
+
+Leave `Domain`/`Username`/`Password` out entirely to run as whatever
+account the process/scheduled task is already running as. `LogFile` is
+optional but worth setting -- stdout isn't visible when Task Scheduler
+runs this unattended, so the log file is how you'll actually see what
+happened on each run.
+
+### 5. Test it manually first
+
+```
+EwsToSqlSync.exe C:\Path\To\config.json
+```
+
+(or just `EwsToSqlSync.exe` if `config.json` sits next to the `.exe`).
+Confirm it prints `Fetched N message(s)` and `Inserted ... skipped ...`,
+and that rows actually landed in `dbo.MailboxMessages`, before wiring up
+the schedule.
+
+### 6. Register the Task Scheduler job
+
+- **Program/script:** full path to `EwsToSqlSync.exe`
+- **Arguments:** full path to `config.json` (or omit if it's beside the exe)
+- **Run as:** the account that has `ApplicationImpersonation` on the mailbox
+  (step 1) -- or, if using explicit `Domain`/`Username`/`Password` in
+  config.json, the task can run as anything with read access to that file
+- **"Run whether user is logged on or not"** -- so it runs unattended
+- A **daily or hourly trigger**, or whatever cadence fits your reporting
+  needs (there's no harm in running it often -- re-reading already-synced
+  messages just gets skipped as duplicates)
+
+A run that fails exits with code `1` (0 on success), so Task Scheduler's
+own "Last Run Result" column reflects real success/failure without needing
+to parse the log.
 
 ## Security notes worth acting on
 

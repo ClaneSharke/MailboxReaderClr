@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net472</TargetFramework>
+    <AssemblyName>EwsToSqlSync</AssemblyName>
+    <RootNamespace>EwsToSqlSync</RootNamespace>
+    <LangVersion>7.3</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- System.Data.SqlClient lives inside System.Data.dll in .NET Framework, so no NuGet
+         package is needed. System/mscorlib are included automatically. -->
+    <Reference Include="System.Data" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="config.example.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>
